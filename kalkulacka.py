@@ -88,7 +88,9 @@ with st.sidebar:
             "pl_renta_on": st.session_state.get("pl_renta_on", False),
             "pl_renta_roky": st.session_state.get("pl_renta_roky", 10),
             "pl_renta_vynos": st.session_state.get("pl_renta_vynos", 8.0),
-            "pl_renta_castka": st.session_state.get("pl_renta_castka", 50000.0)
+            "pl_renta_castka": st.session_state.get("pl_renta_castka", 50000.0),
+            "pl_pozn_uvod": st.session_state.get("pl_pozn_uvod", ""),
+            "pl_pozn_zaver": st.session_state.get("pl_pozn_zaver", "")
         }
         return json.dumps(data)
 

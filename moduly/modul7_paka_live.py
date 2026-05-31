@@ -66,6 +66,9 @@ VYCHOZI_PAKA = {
     "pl_renta_roky": 10,
     "pl_renta_vynos": 8.0,
     "pl_renta_castka": 50000.0,
+    # Volné poznámky poradce do PDF nabídky (úvodní oslovení + závěrečné sdělení)
+    "pl_pozn_uvod": "",
+    "pl_pozn_zaver": "",
 }
 
 PO_VYCERPANI_OPTIONS = [
@@ -423,7 +426,8 @@ def _verdikty_text(S, doba, splatka, po_vycerpani, renta_on, renta_castka, renta
 def _vytvor_pdf(klient, poradce, hypo, sazba, doba, public0, fki0,
                 vyn_public, vyn_fki, spoluucast, inflace, po_vycerpani,
                 renta_on, renta_castka, renta_vynos, renta_roky, df_mesic, S,
-                vek=None, doplatit_on=False, doplatit_rok=0):
+                vek=None, doplatit_on=False, doplatit_rok=0,
+                pozn_uvod="", pozn_zaver=""):
     """Sestaví klientskou nabídku jako PDF a vrátí bytes."""
     png = _graf_pro_pdf(df_mesic, S, renta_on)
 
@@ -475,6 +479,19 @@ def _vytvor_pdf(klient, poradce, hypo, sazba, doba, public0, fki0,
 
     pdf.set_y(34)
     pdf.set_text_color(30, 30, 30)
+
+    # ---- ÚVODNÍ OSLOVENÍ PORADCE (volitelné) ----
+    if pozn_uvod and pozn_uvod.strip():
+        pdf.set_x(19)
+        pdf.set_font("DejaVu", "", 10)
+        pdf.set_text_color(45, 45, 45)
+        y0 = pdf.get_y()
+        pdf.multi_cell(176, 5.2, pozn_uvod.strip())
+        y1 = pdf.get_y()
+        pdf.set_fill_color(*_NAVY)
+        pdf.rect(15, y0, 1.8, y1 - y0, "F")
+        pdf.ln(3)
+        pdf.set_text_color(30, 30, 30)
 
     # ---- SEKCE: ZADÁNÍ ----
     _pdf_nadpis(pdf, "Zadání")
@@ -563,6 +580,14 @@ def _vytvor_pdf(klient, poradce, hypo, sazba, doba, public0, fki0,
         pdf.set_text_color(40, 40, 40)
         pdf.multi_cell(176, 4.6, text)
         pdf.ln(2.5)
+
+    # ---- SDĚLENÍ PORADCE (volitelné) ----
+    if pozn_zaver and pozn_zaver.strip():
+        _pdf_nadpis(pdf, "Sdělení poradce")
+        pdf.set_font("DejaVu", "", 9.5)
+        pdf.set_text_color(40, 40, 40)
+        pdf.multi_cell(176, 4.8, pozn_zaver.strip())
+        pdf.ln(1)
 
     # ---- UPOZORNĚNÍ (DISCLAIMER) ----
     _pdf_nadpis(pdf, "Upozornění")
@@ -927,6 +952,16 @@ def render(tab):
                            "berou z horní části. PDF odráží hodnoty v okamžiku vygenerování — "
                            "po změně posuvníků vygeneruj znovu.")
                 poradce = st.text_input("Zpracoval (poradce)", value="Jiří Vrána", key="pl_poradce")
+                pozn_uvod = st.text_area(
+                    "✍️ Úvodní oslovení klienta (volitelné)", key="pl_pozn_uvod",
+                    placeholder="Vážený pane Nováku, na základě naší konzultace jsem pro Vás připravil…",
+                    help="Osobní úvod hned pod hlavičkou nabídky. Když necháš prázdné, v PDF se nezobrazí."
+                )
+                pozn_zaver = st.text_area(
+                    "🗒️ Sdělení poradce – komentář ke strategii (volitelné)", key="pl_pozn_zaver",
+                    placeholder="Toto rozložení PUBLIC/FKI volím proto, že…",
+                    help="Věcný komentář na závěr (před upozorněním). Když necháš prázdné, v PDF se nezobrazí."
+                )
                 if klient_cele:
                     st.caption(f"📋 Nabídka pro: **{klient_cele}**, {int(vek)} let")
                 if st.button("🖨️ Vygenerovat nabídku (PDF)", key="btn_paka_pdf_gen"):
@@ -936,7 +971,8 @@ def render(tab):
                                 klient_cele, poradce, hypo, sazba, doba, public0, fki0,
                                 vyn_public, vyn_fki, spoluucast, inflace, po_vycerpani,
                                 renta_on, renta_castka, renta_vynos, renta_roky, df_mesic, S,
-                                vek=int(vek), doplatit_on=doplatit_on, doplatit_rok=doplatit_rok
+                                vek=int(vek), doplatit_on=doplatit_on, doplatit_rok=doplatit_rok,
+                                pozn_uvod=pozn_uvod, pozn_zaver=pozn_zaver
                             )
                         except Exception as e:
                             st.session_state.pop("pl_pdf_bytes", None)
