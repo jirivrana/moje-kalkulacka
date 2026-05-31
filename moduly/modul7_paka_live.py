@@ -112,6 +112,7 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
     celkem_z_kapsy = 0.0
     celkem_z_fki = 0.0
     celkem_uroky = 0.0
+    odkup_kum = 0.0  # kumulativní odkupy z portfolia na sanaci splátky (fáze 1)
 
     renta_vyplaceno = 0.0
     renta_dosla_mesic = None
@@ -120,11 +121,12 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
     majetek_konec_p1 = public0 + fki0
     majetek_real_konec_p1 = public0 + fki0
 
-    xs, h, pub, f, maj, maj_real, zust_real = [], [], [], [], [], [], []
+    xs, h, pub, f, maj, maj_real, zust_real, odk, rnt = [], [], [], [], [], [], [], [], []
     rok_rows = [{
         "Rok": 0, "Věk": float(vek), "Zůstatek hypotéky": zust, "PUBLIC složka": public,
         "FKI složka": fki, "Majetek celkem": public + fki,
-        "Majetek reálně": public + fki
+        "Majetek reálně": public + fki,
+        "Odkupy na sanaci (kumul.)": 0.0, "Vyplacená renta (kumul.)": 0.0
     }]
 
     for m in range(1, mesice_celkem + 1):
@@ -170,6 +172,7 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
                 z_public = min(public, potreba)
                 public -= z_public
                 potreba -= z_public
+                odkup_kum += z_public  # odkup z PUBLIC fondu na sanaci splátky
 
                 if potreba > 0:
                     if public_vycerpan_mesic is None and public <= 0.01:
@@ -187,6 +190,7 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
                         fki -= z_fki
                         potreba -= z_fki
                         celkem_z_fki += z_fki
+                        odkup_kum += z_fki  # odkup z FKI na sanaci splátky
                         z_kapsy += potreba
                         potreba = 0.0
                     else:
@@ -221,19 +225,24 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
         maj.append(majetek)
         maj_real.append(majetek / coef)
         zust_real.append(max(0.0, zust) / coef)
+        odk.append(odkup_kum)
+        rnt.append(renta_vyplaceno)
 
         if m % 12 == 0:
             rok_rows.append({
                 "Rok": m // 12, "Věk": float(vek + m // 12), "Zůstatek hypotéky": max(0.0, zust),
                 "PUBLIC složka": public, "FKI složka": fki,
-                "Majetek celkem": majetek, "Majetek reálně": majetek / coef
+                "Majetek celkem": majetek, "Majetek reálně": majetek / coef,
+                "Odkupy na sanaci (kumul.)": odkup_kum,
+                "Vyplacená renta (kumul.)": renta_vyplaceno
             })
 
     df_rok = pd.DataFrame(rok_rows)
     df_mesic = pd.DataFrame({
         "Rok": xs, "Věk": [vek + x for x in xs],
         "Zůstatek hypotéky": h, "PUBLIC složka": pub, "FKI složka": f,
-        "Majetek celkem": maj, "Majetek reálně": maj_real, "Dluh reálně": zust_real
+        "Majetek celkem": maj, "Majetek reálně": maj_real, "Dluh reálně": zust_real,
+        "Odkupy na sanaci (kumul.)": odk, "Vyplacená renta (kumul.)": rnt
     })
 
     # Udržitelnost renty (fáze 2)
@@ -302,6 +311,11 @@ def _graf_pro_pdf(df_mesic, S, renta_on):
         ax.plot(x, df_mesic["PUBLIC složka"], color="#2980b9", lw=1.8, label="PUBLIC fond")
         ax.plot(x, df_mesic["FKI složka"], color="#27ae60", lw=2.4, label="FKI fond")
         ax.plot(x, df_mesic["Majetek celkem"], color="#7f8c8d", lw=1.6, ls=":", label="Majetek celkem")
+        ax.plot(x, df_mesic["Odkupy na sanaci (kumul.)"], color="#e67e22", lw=1.4, ls="-.",
+                label="Odkupy na sanaci (kumul.)")
+        if renta_on:
+            ax.plot(x, df_mesic["Vyplacená renta (kumul.)"], color="#16a085", lw=2.0,
+                    label="Vyplacená renta (kumul.)")
         ax.set_xlabel("Rok")
         ax.set_ylabel("Kč")
         ax.margins(x=0.01)
@@ -725,6 +739,17 @@ def render(tab):
         fig.add_trace(go.Scatter(x=df_mesic["Rok"], y=df_mesic["Dluh reálně"],
                                  name="Dluh reálně (po inflaci)",
                                  line=dict(color="#e67e22", dash="dot"), visible="legendonly"))
+        # Kumulativní odkupy z portfolia na sanaci splátky (fáze 1)
+        fig.add_trace(go.Scatter(x=df_mesic["Rok"], y=df_mesic["Odkupy na sanaci (kumul.)"],
+                                 name="Odkupy na sanaci (kumul.)",
+                                 line=dict(color="#e67e22", width=2, dash="dashdot"),
+                                 hovertemplate="Odkupy na sanaci: %{y:,.0f} Kč<extra></extra>"))
+        # Kumulativní vyplacená renta (fáze 2) — roste od startu čerpání
+        if renta_on:
+            fig.add_trace(go.Scatter(x=df_mesic["Rok"], y=df_mesic["Vyplacená renta (kumul.)"],
+                                     name="Vyplacená renta (kumul.)",
+                                     line=dict(color="#1abc9c", width=2.5),
+                                     hovertemplate="Vyplacená renta: %{y:,.0f} Kč<extra></extra>"))
 
         # Svislé čáry událostí. Pozor: při "Jednorázově doplatit z FKI" padne vyčerpání PUBLIC
         # a doplacení úvěru do stejného měsíce → sloučíme do jedné čáry, popisky dáme na opačné
@@ -846,7 +871,8 @@ def render(tab):
         total_years = int(doba) + (int(renta_roky) if renta_on else 0)
         roky_k_zobrazeni = sorted(set([0] + list(range(5, total_years + 1, 5)) + [int(doba), total_years]))
         df_tab = df_rok[df_rok["Rok"].isin(roky_k_zobrazeni)].copy()
-        df_fmt = df_tab.copy()
+        # Souhrnnou tabulku držíme přehlednou — kumulativní odkupy/rentu necháme do detailu níž
+        df_fmt = df_tab.drop(columns=["Odkupy na sanaci (kumul.)", "Vyplacená renta (kumul.)"]).copy()
         df_fmt["Věk"] = df_fmt["Věk"].astype(int)
         for sl in ["Zůstatek hypotéky", "PUBLIC složka", "FKI složka", "Majetek celkem", "Majetek reálně"]:
             df_fmt[sl] = df_fmt[sl].apply(_kc)
@@ -880,7 +906,8 @@ def render(tab):
         with st.expander("📊 Detailní tabulka po letech & Export"):
             df_rok_fmt = df_rok.copy()
             df_rok_fmt["Věk"] = df_rok_fmt["Věk"].astype(int)
-            for sl in ["Zůstatek hypotéky", "PUBLIC složka", "FKI složka", "Majetek celkem", "Majetek reálně"]:
+            for sl in ["Zůstatek hypotéky", "PUBLIC složka", "FKI složka", "Majetek celkem",
+                       "Majetek reálně", "Odkupy na sanaci (kumul.)", "Vyplacená renta (kumul.)"]:
                 df_rok_fmt[sl] = df_rok_fmt[sl].apply(_kc)
             st.dataframe(df_rok_fmt, use_container_width=True, hide_index=True)
             st.download_button(
