@@ -34,10 +34,12 @@ DISCLAIMER = (
     "dlouhodobého průměrného zhodnocení. Nejde o závaznou nabídku, veřejný příslib ani investiční "
     "doporučení ve smyslu zákona. Uvedené výnosy nejsou garantované — skutečné zhodnocení se může "
     "lišit, hodnota investice v čase kolísá a kolísat může i návratnost vložených prostředků. "
-    "Minulé výnosy nejsou zárukou výnosů budoucích. Propočet nezohledňuje daně, vstupní a "
-    "průběžné poplatky fondů ani případné změny úrokových sazeb hypotéky v čase. Před rozhodnutím "
-    "se řiďte statuty a sděleními klíčových informací konkrétních fondů a poraďte se se svým "
-    "finančním poradcem."
+    "Minulé výnosy nejsou zárukou výnosů budoucích a uvedená zhodnocení nezahrnují případné změny "
+    "úrokové sazby hypotéky v čase. Vstupní poplatek za zprostředkování a nastavení strategie se "
+    "řídí smlouvou s poradcem. Při splnění zákonného časového testu (u cenných papírů zpravidla "
+    "3 roky držby) mohou být příjmy z prodeje osvobozeny od daně z příjmů; konkrétní podmínky, "
+    "aktuální limity a daňové dopady ve své situaci konzultujte s poradcem. Před rozhodnutím se "
+    "řiďte statuty a sděleními klíčových informací konkrétních fondů."
 )
 
 # --- VÝCHOZÍ HODNOTY (živé posuvníky) ---
