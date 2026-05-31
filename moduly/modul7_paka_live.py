@@ -1,7 +1,22 @@
+import io
+import os
+import re
+from datetime import date
+
 import streamlit as st
 import numpy_financial as npf
 import pandas as pd
 import plotly.graph_objects as go
+
+# PDF výstup je volitelný — když balíček chybí (např. během deploye), appka poběží dál.
+try:
+    from fpdf import FPDF
+    _PDF_OK = True
+except Exception:
+    _PDF_OK = False
+
+# Fonty s českou diakritikou (přibalené v repu ve složce fonts/)
+FONTS_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "fonts"))
 
 # --- VÝCHOZÍ HODNOTY (živé posuvníky) ---
 VYCHOZI_PAKA = {
@@ -198,6 +213,271 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
         "dluh_real_konec_p1": zust_real[mesice_p1 - 1] if mesice_p1 > 0 and len(zust_real) >= mesice_p1 else 0.0,
     }
     return df_rok, df_mesic, souhrn
+
+
+# =========================================================================
+#  PDF NABÍDKA PRO KLIENTA
+# =========================================================================
+
+# Barvy (RGB) pro verdikty
+_ZELENA = (39, 174, 96)
+_ZLUTA = (241, 196, 15)
+_CERVENA = (231, 76, 60)
+_NAVY = (31, 42, 68)
+
+
+def _graf_pro_pdf(df_mesic, S, renta_on):
+    """Vykreslí graf ve světlém motivu (pro bílý papír) a vrátí PNG bytes."""
+    try:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df_mesic["Rok"], y=df_mesic["Zůstatek hypotéky"],
+                                 name="Hypotéka", line=dict(color="#e74c3c", width=2)))
+        fig.add_trace(go.Scatter(x=df_mesic["Rok"], y=df_mesic["PUBLIC složka"],
+                                 name="PUBLIC fond", line=dict(color="#2980b9", width=2)))
+        fig.add_trace(go.Scatter(x=df_mesic["Rok"], y=df_mesic["FKI složka"],
+                                 name="FKI fond", line=dict(color="#27ae60", width=3)))
+        fig.add_trace(go.Scatter(x=df_mesic["Rok"], y=df_mesic["Majetek celkem"],
+                                 name="Majetek celkem", line=dict(color="#7f8c8d", width=2, dash="dot")))
+        dop = S["jednorazovy_doplatek_mesic"]
+        vyc = S["public_vycerpan_mesic"]
+        if dop:
+            fig.add_vline(x=dop / 12, line_width=1.5, line_dash="dot", line_color="#f39c12",
+                          annotation_text="Úvěr doplacen z FKI", annotation_position="top left")
+        elif vyc:
+            fig.add_vline(x=vyc / 12, line_width=1.5, line_dash="dash", line_color="#e74c3c",
+                          annotation_text="PUBLIC vyčerpán", annotation_position="top left")
+        if renta_on:
+            fig.add_vline(x=S["mesice_p1"] / 12, line_width=1.5, line_dash="dash", line_color="#16a085",
+                          annotation_text="Start renty", annotation_position="top right")
+        fig.update_layout(
+            template="plotly_white", paper_bgcolor="white", plot_bgcolor="white",
+            font_color="#222222", xaxis_title="Rok", yaxis_title="Kč",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            margin=dict(l=60, r=20, t=40, b=40)
+        )
+        return fig.to_image(format="png", width=1200, height=420, scale=2)
+    except Exception:
+        return None
+
+
+def _verdikty_text(S, doba, splatka, po_vycerpani, renta_on, renta_castka, renta_vynos, renta_roky):
+    """Vrátí seznam verdiktů jako (barva, nadpis, text) — textová obdoba boxů z appky."""
+    out = []
+    vyc_m = S["public_vycerpan_mesic"]
+    if S["jednorazovy_doplatek_mesic"]:
+        rok_dop = (S["jednorazovy_doplatek_mesic"] + 11) // 12
+        out.append((_ZELENA, "Páka vyšla",
+                    f"V {rok_dop}. roce už byl majetek tak velký, že se zbytek úvěru "
+                    f"({_kc(S['celkem_z_fki'])}) jednorázově doplatil z FKI fondu. "
+                    f"Dál roste čistý majetek bez dluhu."))
+    elif vyc_m is None:
+        out.append((_ZELENA, "Udržitelné",
+                    f"PUBLIC fond celou dobu pokryl sanaci splátky a na konci splácení "
+                    f"ještě zbývá {_kc(S['public_konec_p1'])}."))
+    else:
+        rok_vyc = (vyc_m + 11) // 12
+        podil = vyc_m / S["mesice_p1"]
+        zbyva_let = (S["mesice_p1"] - vyc_m) / 12
+        if po_vycerpani == "Doplácet z FKI fondu":
+            dovysv = (f"Od {rok_vyc}. roku se zbytek splátky tahá z FKI "
+                      f"(celkem {_kc(S['celkem_z_fki'])}) — ukrajuje se z růstového motoru.")
+        else:
+            dovysv = (f"Od {rok_vyc}. roku se doplácí celá splátka (~{_kc(splatka)}/měs) "
+                      f"z vlastní kapsy ještě {zbyva_let:.1f} let.")
+        if podil >= 0.75:
+            out.append((_ZLUTA, "Na hraně",
+                        f"PUBLIC vydrží až do {rok_vyc}. roku (většinu doby). {dovysv}"))
+        else:
+            out.append((_CERVENA, "Pozor, vybírá se moc",
+                        f"PUBLIC se vyčerpá už v {rok_vyc}. roce. {dovysv} "
+                        f"Doporučení: zvýšit spoluúčast nebo přidat do PUBLIC fondu."))
+
+    if renta_on and S["pool_start_faze2"]:
+        if S["renta_udrzitelna"]:
+            out.append((_ZELENA, "Renta prakticky nevyčerpatelná",
+                        f"Po {int(doba)} letech je vybudováno {_kc(S['pool_start_faze2'])}. "
+                        f"Při čerpání {_kc(renta_castka)}/měs majetek i tak roste "
+                        f"(výnos {renta_vynos:.1f} % > čerpání) — žije se z výnosů, jistina zůstává."))
+        elif S["renta_dosla_mesic"]:
+            rok_dosla = (S["renta_dosla_mesic"] - S["mesice_p1"]) / 12
+            out.append((_CERVENA, "Renta je příliš vysoká",
+                        f"Po {int(doba)} letech je vybudováno {_kc(S['pool_start_faze2'])}, ale "
+                        f"při čerpání {_kc(renta_castka)}/měs se majetek vyčerpá za ~{rok_dosla:.1f} let. "
+                        f"Doporučení: snížit rentu na úroveň výnosů."))
+        else:
+            out.append((_ZLUTA, "Čerpá se i jistina",
+                        f"Po {int(doba)} letech je vybudováno {_kc(S['pool_start_faze2'])}. "
+                        f"Renta {_kc(renta_castka)}/měs je vyšší než výnos, majetek pomalu ubývá, "
+                        f"ale za zvolených {int(renta_roky)} let nedojde."))
+    return out
+
+
+def _vytvor_pdf(klient, poradce, hypo, sazba, doba, public0, fki0,
+                vyn_public, vyn_fki, spoluucast, inflace, po_vycerpani,
+                renta_on, renta_castka, renta_vynos, renta_roky, df_mesic, S):
+    """Sestaví klientskou nabídku jako PDF a vrátí bytes."""
+    png = _graf_pro_pdf(df_mesic, S, renta_on)
+
+    class _Nabidka(FPDF):
+        def footer(self):
+            self.set_y(-16)
+            self.set_font("DejaVu", "", 7)
+            self.set_text_color(150, 150, 150)
+            zprac = getattr(self, "poradce_jmeno", "") or ""
+            radek = ("Orientační propočet, nejde o závaznou nabídku ani investiční doporučení. "
+                     "Skutečné výnosy a sazby se mohou lišit.")
+            if zprac:
+                radek += f"  •  Zpracoval: {zprac}"
+            self.multi_cell(0, 3.5, radek, align="C")
+
+    pdf = _Nabidka(orientation="P", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=18)
+    pdf.set_margins(15, 15, 15)
+    pdf.add_font("DejaVu", "", os.path.join(FONTS_DIR, "DejaVuSans.ttf"))
+    pdf.add_font("DejaVu", "B", os.path.join(FONTS_DIR, "DejaVuSans-Bold.ttf"))
+    pdf.poradce_jmeno = poradce
+    pdf.add_page()
+
+    # ---- HLAVIČKA ----
+    pdf.set_fill_color(*_NAVY)
+    pdf.rect(0, 0, 210, 28, "F")
+    pdf.set_xy(15, 7)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("DejaVu", "B", 17)
+    pdf.cell(135, 8, "Finanční analýza páky")
+    pdf.set_xy(15, 16)
+    pdf.set_font("DejaVu", "", 10)
+    pdf.set_text_color(180, 190, 210)
+    pdf.cell(135, 6, "Hypotéka jako investiční nástroj — nabídka")
+    pdf.set_xy(150, 7)
+    pdf.set_font("DejaVu", "", 9)
+    pdf.set_text_color(225, 230, 240)
+    pdf.cell(45, 6, date.today().strftime("%d.%m.%Y"), align="R")
+    if klient:
+        pdf.set_xy(120, 16)
+        pdf.cell(75, 6, f"Klient: {klient}", align="R")
+
+    pdf.set_y(34)
+    pdf.set_text_color(30, 30, 30)
+
+    # ---- SEKCE: ZADÁNÍ ----
+    _pdf_nadpis(pdf, "Zadání")
+    params = [
+        ("Výše hypotéky", _kc(hypo)),
+        ("Sazba hypotéky", f"{sazba:.2f} % p.a."),
+        ("Doba splácení", f"{int(doba)} let"),
+        ("Vklad do PUBLIC fondu", _kc(public0)),
+        ("Vklad do FKI fondu", _kc(fki0)),
+        ("Výnos PUBLIC", f"{vyn_public:.1f} % p.a."),
+        ("Výnos FKI", f"{vyn_fki:.1f} % p.a."),
+        ("Spoluúčast z kapsy", f"{_kc(spoluucast)} / měs"),
+        ("Inflace", f"{inflace:.1f} % p.a."),
+        ("Po vyčerpání PUBLIC", po_vycerpani),
+    ]
+    pdf.set_font("DejaVu", "", 9.5)
+    for i in range(0, len(params), 2):
+        y0 = pdf.get_y()
+        pdf.set_text_color(110, 110, 110)
+        pdf.cell(38, 6, params[i][0])
+        pdf.set_text_color(20, 20, 20)
+        pdf.set_font("DejaVu", "B", 9.5)
+        pdf.cell(52, 6, params[i][1])
+        pdf.set_font("DejaVu", "", 9.5)
+        if i + 1 < len(params):
+            pdf.set_text_color(110, 110, 110)
+            pdf.cell(38, 6, params[i + 1][0])
+            pdf.set_text_color(20, 20, 20)
+            pdf.set_font("DejaVu", "B", 9.5)
+            pdf.cell(52, 6, params[i + 1][1])
+            pdf.set_font("DejaVu", "", 9.5)
+        pdf.set_xy(15, y0 + 7)
+
+    # ---- SEKCE: KLÍČOVÉ VÝSLEDKY ----
+    _pdf_nadpis(pdf, "Klíčové výsledky")
+    boxy = [
+        ("Měsíční splátka hypotéky", _kc(S["splatka"]), _NAVY),
+        ("Vybudovaný majetek (konec splácení)", _kc(S["majetek_konec_p1"]), _NAVY),
+        ("Čistý zisk z arbitráže", _kc(S["arbitraz"]), _ZELENA),
+        ("Reálný majetek (dnešní Kč)", _kc(S["majetek_real_konec_p1"]), _NAVY),
+        ("Reálný zbytek dluhu (po inflaci)", _kc(S["dluh_real_konec_p1"]), _NAVY),
+        ("Zaplaceno z vlastní kapsy", _kc(S["celkem_z_kapsy"]), _NAVY),
+    ]
+    bw, bh, gap = 56.66, 18, 4
+    y_start = pdf.get_y()
+    for idx, (label, value, accent) in enumerate(boxy):
+        col = idx % 3
+        row = idx // 3
+        x = 15 + col * (bw + gap)
+        y = y_start + row * (bh + gap)
+        _pdf_box(pdf, x, y, bw, bh, label, value, accent)
+    pdf.set_y(y_start + 2 * (bh + gap) + 1)
+    pdf.set_font("DejaVu", "", 8.5)
+    pdf.set_text_color(110, 110, 110)
+    pdf.cell(0, 5, f"Z toho úroky zaplacené bance: {_kc(S['celkem_uroky'])}",
+             new_x="LMARGIN", new_y="NEXT")
+    if renta_on and S["pool_start_faze2"]:
+        pdf.cell(0, 5, f"Celkem vyčerpáno na rentě: {_kc(S['renta_vyplaceno'])}",
+                 new_x="LMARGIN", new_y="NEXT")
+
+    # ---- GRAF ----
+    _pdf_nadpis(pdf, "Vývoj majetku a dluhu v čase")
+    if png:
+        pdf.image(io.BytesIO(png), x=15, w=180)
+    else:
+        pdf.set_font("DejaVu", "", 9)
+        pdf.set_text_color(150, 150, 150)
+        pdf.cell(0, 6, "(Graf se nepodařilo vykreslit.)", new_x="LMARGIN", new_y="NEXT")
+
+    # ---- VYHODNOCENÍ ----
+    _pdf_nadpis(pdf, "Vyhodnocení")
+    for barva, nadpis, text in _verdikty_text(
+        S, doba, S["splatka"], po_vycerpani, renta_on, renta_castka, renta_vynos, renta_roky
+    ):
+        y0 = pdf.get_y()
+        pdf.set_fill_color(*barva)
+        pdf.rect(15, y0 + 0.5, 2, 9, "F")
+        pdf.set_xy(19, y0)
+        pdf.set_font("DejaVu", "B", 10.5)
+        pdf.set_text_color(*barva)
+        pdf.cell(0, 5, nadpis, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_x(19)
+        pdf.set_font("DejaVu", "", 9.5)
+        pdf.set_text_color(40, 40, 40)
+        pdf.multi_cell(176, 4.6, text)
+        pdf.ln(2.5)
+
+    out = pdf.output()
+    return bytes(out)
+
+
+def _pdf_nadpis(pdf, txt):
+    pdf.ln(1.5)
+    pdf.set_font("DejaVu", "B", 12)
+    pdf.set_text_color(*_NAVY)
+    pdf.cell(0, 7, txt, new_x="LMARGIN", new_y="NEXT")
+    y = pdf.get_y()
+    pdf.set_draw_color(*_NAVY)
+    pdf.set_line_width(0.3)
+    pdf.line(15, y, 195, y)
+    pdf.ln(2)
+    pdf.set_text_color(30, 30, 30)
+
+
+def _pdf_box(pdf, x, y, w, h, label, value, accent):
+    pdf.set_fill_color(246, 248, 250)
+    pdf.set_draw_color(225, 228, 232)
+    pdf.set_line_width(0.3)
+    pdf.rect(x, y, w, h, "DF")
+    pdf.set_fill_color(*accent)
+    pdf.rect(x, y, 1.8, h, "F")
+    pdf.set_xy(x + 4, y + 3)
+    pdf.set_font("DejaVu", "", 7.5)
+    pdf.set_text_color(110, 110, 110)
+    pdf.multi_cell(w - 6, 3.6, label)
+    pdf.set_xy(x + 4, y + h - 9)
+    pdf.set_font("DejaVu", "B", 12)
+    pdf.set_text_color(*accent)
+    pdf.cell(w - 6, 6, value)
 
 
 def render(tab):
@@ -442,3 +722,36 @@ def render(tab):
                 df_rok.round(2).to_csv(index=False).encode("utf-8"),
                 "paka_live.csv", "text/csv", key="btn_paka_live_csv"
             )
+
+        # --- NABÍDKA PRO KLIENTA (PDF) ---
+        with st.expander("📄 Nabídka pro klienta (PDF)"):
+            if not _PDF_OK:
+                st.warning("Generování PDF zatím není dostupné (instaluje se balíček fpdf2). "
+                           "Zkus to prosím za chvíli po nasazení.")
+            else:
+                st.caption("Vygeneruje čistou jednostránkovou nabídku s aktuálními hodnotami "
+                           "(zadání, klíčová čísla, graf a vyhodnocení). PDF odráží hodnoty "
+                           "v okamžiku vygenerování — po změně posuvníků vygeneruj znovu.")
+                pc1, pc2 = st.columns(2)
+                klient = pc1.text_input("Jméno klienta (volitelné)", key="pl_klient")
+                poradce = pc2.text_input("Zpracoval (poradce)", value="Jiří Vrána", key="pl_poradce")
+                if st.button("🖨️ Vygenerovat nabídku (PDF)", key="btn_paka_pdf_gen"):
+                    with st.spinner("Generuji PDF…"):
+                        try:
+                            st.session_state["pl_pdf_bytes"] = _vytvor_pdf(
+                                klient, poradce, hypo, sazba, doba, public0, fki0,
+                                vyn_public, vyn_fki, spoluucast, inflace, po_vycerpani,
+                                renta_on, renta_castka, renta_vynos, renta_roky, df_mesic, S
+                            )
+                        except Exception as e:
+                            st.session_state.pop("pl_pdf_bytes", None)
+                            st.error(f"Nepodařilo se vygenerovat PDF: {e}")
+                if st.session_state.get("pl_pdf_bytes"):
+                    bezpecne_jmeno = re.sub(r"[^\w\-]+", "_", (klient or "klient").strip()) or "klient"
+                    st.download_button(
+                        "📥 Stáhnout nabídku (PDF)",
+                        st.session_state["pl_pdf_bytes"],
+                        file_name=f"nabidka_paka_{bezpecne_jmeno}.pdf",
+                        mime="application/pdf",
+                        key="btn_paka_pdf_dl"
+                    )
