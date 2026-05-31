@@ -4,4 +4,4 @@ numpy-financial
 plotly
 openpyxl
 fpdf2
-kaleido
+matplotlib

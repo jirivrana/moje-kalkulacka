@@ -15,14 +15,43 @@ try:
 except Exception:
     _PDF_OK = False
 
+# Graf do PDF kreslíme přes matplotlib (čistě serverový, bez prohlížeče → funguje na Streamlit Cloudu).
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter
+    _MPL_OK = True
+except Exception:
+    _MPL_OK = False
+
 # Fonty s českou diakritikou (přibalené v repu ve složce fonts/)
 FONTS_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "fonts"))
 
+# Investiční disclaimer pro klientskou nabídku
+DISCLAIMER = (
+    "Tento dokument je orientační modelací zpracovanou na základě analýzy fondů a jejich "
+    "dlouhodobého průměrného zhodnocení. Nejde o závaznou nabídku, veřejný příslib ani investiční "
+    "doporučení ve smyslu zákona. Uvedené výnosy nejsou garantované — skutečné zhodnocení se může "
+    "lišit, hodnota investice v čase kolísá a kolísat může i návratnost vložených prostředků. "
+    "Minulé výnosy nejsou zárukou výnosů budoucích. Propočet nezohledňuje daně, vstupní a "
+    "průběžné poplatky fondů ani případné změny úrokových sazeb hypotéky v čase. Před rozhodnutím "
+    "se řiďte statuty a sděleními klíčových informací konkrétních fondů a poraďte se se svým "
+    "finančním poradcem."
+)
+
 # --- VÝCHOZÍ HODNOTY (živé posuvníky) ---
 VYCHOZI_PAKA = {
+    # Klient (personalizace nabídky a věkové osy)
+    "pl_klient_jmeno": "",
+    "pl_klient_prijmeni": "",
+    "pl_klient_vek": 40,
     "pl_hypo": 3000000.0,
     "pl_sazba": 4.69,
     "pl_doba": 20,
+    # What-if: plánované jednorázové doplacení hypotéky z portfolia
+    "pl_doplatit_on": False,
+    "pl_doplatit_rok": 10,
     "pl_public": 1500000.0,
     "pl_fki": 1500000.0,
     "pl_vyn_public": 7.0,
@@ -59,10 +88,12 @@ def _kc(x):
 
 def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
               spoluucast, inflace, po_vycerpani,
-              renta_on, renta_roky, renta_vynos, renta_castka):
+              renta_on, renta_roky, renta_vynos, renta_castka,
+              vek=40, doplatit_on=False, doplatit_rok=0):
     """Dvoufázová simulace páky.
     Fáze 1: splácení hypotéky, sanace z PUBLIC + kapsy, FKI roste.
-    Fáze 2 (volitelně): čerpání renty z vybudovaného majetku."""
+    Fáze 2 (volitelně): čerpání renty z vybudovaného majetku.
+    Volitelně lze hypotéku plánovaně jednorázově doplatit z portfolia (what-if)."""
     mesice_p1 = int(doba * 12)
     mesice_p2 = int(renta_roky * 12) if renta_on else 0
     mesice_celkem = mesice_p1 + mesice_p2
@@ -75,6 +106,7 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
 
     public_vycerpan_mesic = None
     jednorazovy_doplatek_mesic = None
+    doplatek_plan_mesic = None
     celkem_z_kapsy = 0.0
     celkem_z_fki = 0.0
     celkem_uroky = 0.0
@@ -88,7 +120,7 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
 
     xs, h, pub, f, maj, maj_real, zust_real = [], [], [], [], [], [], []
     rok_rows = [{
-        "Rok": 0, "Zůstatek hypotéky": zust, "PUBLIC složka": public,
+        "Rok": 0, "Věk": float(vek), "Zůstatek hypotéky": zust, "PUBLIC složka": public,
         "FKI složka": fki, "Majetek celkem": public + fki,
         "Majetek reálně": public + fki
     }]
@@ -100,6 +132,22 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
             # ===== FÁZE 1: SPLÁCENÍ + BUDOVÁNÍ =====
             public = public * (1 + (vyn_public / 100) / 12)
             fki = fki * (1 + (vyn_fki / 100) / 12)
+
+            # What-if: plánované jednorázové doplacení hypotéky z portfolia (nejdřív FKI, pak PUBLIC)
+            if doplatit_on and doplatek_plan_mesic is None \
+                    and m == int(doplatit_rok) * 12 and zust > 0.01:
+                k_dopl = zust
+                z_fki = min(fki, k_dopl)
+                fki -= z_fki
+                k_dopl -= z_fki
+                celkem_z_fki += z_fki
+                z_pub = min(public, k_dopl)
+                public -= z_pub
+                k_dopl -= z_pub
+                zust = max(0.0, k_dopl)
+                if zust <= 0.01:
+                    zust = 0.0
+                    doplatek_plan_mesic = m
 
             if zust > 0.01:
                 urok = zust * (sazba / 100) / 12
@@ -174,14 +222,15 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
 
         if m % 12 == 0:
             rok_rows.append({
-                "Rok": m // 12, "Zůstatek hypotéky": max(0.0, zust),
+                "Rok": m // 12, "Věk": float(vek + m // 12), "Zůstatek hypotéky": max(0.0, zust),
                 "PUBLIC složka": public, "FKI složka": fki,
                 "Majetek celkem": majetek, "Majetek reálně": majetek / coef
             })
 
     df_rok = pd.DataFrame(rok_rows)
     df_mesic = pd.DataFrame({
-        "Rok": xs, "Zůstatek hypotéky": h, "PUBLIC složka": pub, "FKI složka": f,
+        "Rok": xs, "Věk": [vek + x for x in xs],
+        "Zůstatek hypotéky": h, "PUBLIC složka": pub, "FKI složka": f,
         "Majetek celkem": maj, "Majetek reálně": maj_real, "Dluh reálně": zust_real
     })
 
@@ -203,6 +252,9 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
         "celkem_uroky": celkem_uroky,
         "public_vycerpan_mesic": public_vycerpan_mesic,
         "jednorazovy_doplatek_mesic": jednorazovy_doplatek_mesic,
+        "doplatek_plan_mesic": doplatek_plan_mesic,
+        "vek": vek,
+        "vek_konec_p1": vek + doba,
         "public_konec_p1": pub[mesice_p1 - 1] if mesice_p1 > 0 and len(pub) >= mesice_p1 else 0.0,
         "mesice_p1": mesice_p1,
         "mesice_celkem": mesice_celkem,
@@ -226,45 +278,86 @@ _CERVENA = (231, 76, 60)
 _NAVY = (31, 42, 68)
 
 
+def _kc_osa(v, _pos=None):
+    """Formátování hodnot osy Y (miliony / tisíce)."""
+    if abs(v) >= 1e6:
+        return f"{v / 1e6:.1f} M".replace(".", ",")
+    if abs(v) >= 1e3:
+        return f"{v / 1e3:.0f} k"
+    return f"{v:.0f}"
+
+
 def _graf_pro_pdf(df_mesic, S, renta_on):
-    """Vykreslí graf ve světlém motivu (pro bílý papír) a vrátí PNG bytes."""
+    """Vykreslí graf přes matplotlib (serverově, bez prohlížeče) a vrátí PNG bytes.
+    Nahoře sekundární osa s věkem klienta."""
+    if not _MPL_OK:
+        return None
     try:
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df_mesic["Rok"], y=df_mesic["Zůstatek hypotéky"],
-                                 name="Hypotéka", line=dict(color="#e74c3c", width=2)))
-        fig.add_trace(go.Scatter(x=df_mesic["Rok"], y=df_mesic["PUBLIC složka"],
-                                 name="PUBLIC fond", line=dict(color="#2980b9", width=2)))
-        fig.add_trace(go.Scatter(x=df_mesic["Rok"], y=df_mesic["FKI složka"],
-                                 name="FKI fond", line=dict(color="#27ae60", width=3)))
-        fig.add_trace(go.Scatter(x=df_mesic["Rok"], y=df_mesic["Majetek celkem"],
-                                 name="Majetek celkem", line=dict(color="#7f8c8d", width=2, dash="dot")))
+        vek = S.get("vek")
+        x = df_mesic["Rok"]
+        fig, ax = plt.subplots(figsize=(11, 4.4), dpi=150)
+        ax.plot(x, df_mesic["Zůstatek hypotéky"], color="#e74c3c", lw=1.8, label="Hypotéka")
+        ax.plot(x, df_mesic["PUBLIC složka"], color="#2980b9", lw=1.8, label="PUBLIC fond")
+        ax.plot(x, df_mesic["FKI složka"], color="#27ae60", lw=2.4, label="FKI fond")
+        ax.plot(x, df_mesic["Majetek celkem"], color="#7f8c8d", lw=1.6, ls=":", label="Majetek celkem")
+        ax.set_xlabel("Rok")
+        ax.set_ylabel("Kč")
+        ax.margins(x=0.01)
+        ax.set_ylim(bottom=0)
+        ax.grid(True, alpha=0.25)
+        ax.yaxis.set_major_formatter(FuncFormatter(_kc_osa))
+
+        def _udalost(rok, color, txt):
+            ax.axvline(rok, color=color, ls="--", lw=1.2)
+            ax.annotate(txt, xy=(rok, 0.97), xycoords=("data", "axes fraction"),
+                        xytext=(4, 0), textcoords="offset points",
+                        rotation=90, ha="left", va="top", fontsize=8, color=color)
+
+        plan = S.get("doplatek_plan_mesic")
         dop = S["jednorazovy_doplatek_mesic"]
         vyc = S["public_vycerpan_mesic"]
-        if dop:
-            fig.add_vline(x=dop / 12, line_width=1.5, line_dash="dot", line_color="#f39c12",
-                          annotation_text="Úvěr doplacen z FKI", annotation_position="top left")
+        if plan:
+            _udalost(plan / 12, "#8e44ad", "Plánované doplacení")
+        elif dop:
+            _udalost(dop / 12, "#f39c12", "Úvěr doplacen z FKI")
         elif vyc:
-            fig.add_vline(x=vyc / 12, line_width=1.5, line_dash="dash", line_color="#e74c3c",
-                          annotation_text="PUBLIC vyčerpán", annotation_position="top left")
+            _udalost(vyc / 12, "#e74c3c", "PUBLIC vyčerpán")
         if renta_on:
-            fig.add_vline(x=S["mesice_p1"] / 12, line_width=1.5, line_dash="dash", line_color="#16a085",
-                          annotation_text="Start renty", annotation_position="top right")
-        fig.update_layout(
-            template="plotly_white", paper_bgcolor="white", plot_bgcolor="white",
-            font_color="#222222", xaxis_title="Rok", yaxis_title="Kč",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-            margin=dict(l=60, r=20, t=40, b=40)
-        )
-        return fig.to_image(format="png", width=1200, height=420, scale=2)
+            _udalost(S["mesice_p1"] / 12, "#16a085", "Start renty")
+
+        # Sekundární osa nahoře = věk klienta
+        if vek is not None:
+            secax = ax.secondary_xaxis("top", functions=(lambda r: r + vek, lambda a: a - vek))
+            secax.set_xlabel("Věk klienta")
+
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=4,
+                  frameon=False, fontsize=8.5)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight")
+        plt.close(fig)
+        return buf.getvalue()
     except Exception:
+        plt.close("all")
         return None
+
+
+def _vek_txt(S, rok):
+    """Vrátí ' (ve věku N let)' pokud známe věk."""
+    vek = S.get("vek")
+    return f" (ve věku {int(vek + rok)} let)" if vek is not None else ""
 
 
 def _verdikty_text(S, doba, splatka, po_vycerpani, renta_on, renta_castka, renta_vynos, renta_roky):
     """Vrátí seznam verdiktů jako (barva, nadpis, text) — textová obdoba boxů z appky."""
     out = []
     vyc_m = S["public_vycerpan_mesic"]
-    if S["jednorazovy_doplatek_mesic"]:
+    if S.get("doplatek_plan_mesic"):
+        rok_p = (S["doplatek_plan_mesic"] + 11) // 12
+        out.append((_ZELENA, "Plánované doplacení hypotéky",
+                    f"Podle plánu se hypotéka jednorázově doplatila z portfolia v {rok_p}. roce"
+                    f"{_vek_txt(S, rok_p)}. Od té chvíle už není žádná splátka a roste čistý "
+                    f"majetek bez dluhu."))
+    elif S["jednorazovy_doplatek_mesic"]:
         rok_dop = (S["jednorazovy_doplatek_mesic"] + 11) // 12
         out.append((_ZELENA, "Páka vyšla",
                     f"V {rok_dop}. roce už byl majetek tak velký, že se zbytek úvěru "
@@ -293,28 +386,28 @@ def _verdikty_text(S, doba, splatka, po_vycerpani, renta_on, renta_castka, renta
                         f"Doporučení: zvýšit spoluúčast nebo přidat do PUBLIC fondu."))
 
     if renta_on and S["pool_start_faze2"]:
+        zaklad = f"Po {int(doba)} letech{_vek_txt(S, doba)} je vybudováno {_kc(S['pool_start_faze2'])}"
         if S["renta_udrzitelna"]:
             out.append((_ZELENA, "Renta prakticky nevyčerpatelná",
-                        f"Po {int(doba)} letech je vybudováno {_kc(S['pool_start_faze2'])}. "
-                        f"Při čerpání {_kc(renta_castka)}/měs majetek i tak roste "
+                        f"{zaklad}. Při čerpání {_kc(renta_castka)}/měs majetek i tak roste "
                         f"(výnos {renta_vynos:.1f} % > čerpání) — žije se z výnosů, jistina zůstává."))
         elif S["renta_dosla_mesic"]:
             rok_dosla = (S["renta_dosla_mesic"] - S["mesice_p1"]) / 12
             out.append((_CERVENA, "Renta je příliš vysoká",
-                        f"Po {int(doba)} letech je vybudováno {_kc(S['pool_start_faze2'])}, ale "
-                        f"při čerpání {_kc(renta_castka)}/měs se majetek vyčerpá za ~{rok_dosla:.1f} let. "
+                        f"{zaklad}, ale při čerpání {_kc(renta_castka)}/měs se majetek vyčerpá za "
+                        f"~{rok_dosla:.1f} let{_vek_txt(S, doba + rok_dosla)}. "
                         f"Doporučení: snížit rentu na úroveň výnosů."))
         else:
             out.append((_ZLUTA, "Čerpá se i jistina",
-                        f"Po {int(doba)} letech je vybudováno {_kc(S['pool_start_faze2'])}. "
-                        f"Renta {_kc(renta_castka)}/měs je vyšší než výnos, majetek pomalu ubývá, "
-                        f"ale za zvolených {int(renta_roky)} let nedojde."))
+                        f"{zaklad}. Renta {_kc(renta_castka)}/měs je vyšší než výnos, majetek pomalu "
+                        f"ubývá, ale za zvolených {int(renta_roky)} let nedojde."))
     return out
 
 
 def _vytvor_pdf(klient, poradce, hypo, sazba, doba, public0, fki0,
                 vyn_public, vyn_fki, spoluucast, inflace, po_vycerpani,
-                renta_on, renta_castka, renta_vynos, renta_roky, df_mesic, S):
+                renta_on, renta_castka, renta_vynos, renta_roky, df_mesic, S,
+                vek=None, doplatit_on=False, doplatit_rok=0):
     """Sestaví klientskou nabídku jako PDF a vrátí bytes."""
     png = _graf_pro_pdf(df_mesic, S, renta_on)
 
@@ -353,9 +446,16 @@ def _vytvor_pdf(klient, poradce, hypo, sazba, doba, public0, fki0,
     pdf.set_font("DejaVu", "", 9)
     pdf.set_text_color(225, 230, 240)
     pdf.cell(45, 6, date.today().strftime("%d.%m.%Y"), align="R")
+    klient_radek = ""
     if klient:
-        pdf.set_xy(120, 16)
-        pdf.cell(75, 6, f"Klient: {klient}", align="R")
+        klient_radek = f"Klient: {klient}"
+        if vek is not None:
+            klient_radek += f", {int(vek)} let"
+    elif vek is not None:
+        klient_radek = f"Věk klienta: {int(vek)} let"
+    if klient_radek:
+        pdf.set_xy(110, 16)
+        pdf.cell(85, 6, klient_radek, align="R")
 
     pdf.set_y(34)
     pdf.set_text_color(30, 30, 30)
@@ -374,6 +474,8 @@ def _vytvor_pdf(klient, poradce, hypo, sazba, doba, public0, fki0,
         ("Inflace", f"{inflace:.1f} % p.a."),
         ("Po vyčerpání PUBLIC", po_vycerpani),
     ]
+    if doplatit_on:
+        params.append(("Plánované doplacení úvěru", f"v {int(doplatit_rok)}. roce"))
     pdf.set_font("DejaVu", "", 9.5)
     for i in range(0, len(params), 2):
         y0 = pdf.get_y()
@@ -446,6 +548,12 @@ def _vytvor_pdf(klient, poradce, hypo, sazba, doba, public0, fki0,
         pdf.multi_cell(176, 4.6, text)
         pdf.ln(2.5)
 
+    # ---- UPOZORNĚNÍ (DISCLAIMER) ----
+    _pdf_nadpis(pdf, "Upozornění")
+    pdf.set_font("DejaVu", "", 8)
+    pdf.set_text_color(95, 95, 95)
+    pdf.multi_cell(180, 4, DISCLAIMER)
+
     out = pdf.output()
     return bytes(out)
 
@@ -490,6 +598,13 @@ def render(tab):
             "splátku sanujeme z PUBLIC fondu + vlastní kapsy. **Tahej posuvníky** a sleduj, "
             "jestli to vychází. FKI necháváme růst jako motor majetku."
         )
+
+        # --- KLIENT (personalizace nabídky a věkové osy) ---
+        k1, k2, k3 = st.columns([2, 2, 1])
+        klient_jmeno = k1.text_input("👤 Jméno klienta", key="pl_klient_jmeno")
+        klient_prijmeni = k2.text_input("Příjmení", key="pl_klient_prijmeni")
+        vek = k3.number_input("Věk dnes", min_value=18, max_value=90, step=1, key="pl_klient_vek")
+        klient_cele = f"{klient_jmeno} {klient_prijmeni}".strip()
 
         # --- ZÁKLADNÍ PARAMETRY ---
         c1, c2, c3 = st.columns(3)
@@ -545,6 +660,23 @@ def render(tab):
             help="Inflace rozpouští reálnou hodnotu dluhu (dobré pro dlužníka), ale i reálnou hodnotu majetku."
         )
 
+        # --- WHAT-IF: PLÁNOVANÉ DOPLACENÍ HYPOTÉKY Z PORTFOLIA ---
+        doplatit_on = st.checkbox(
+            "🔪 Co kdybych hypotéku v určitém roce jednorázově doplatil z portfolia?",
+            key="pl_doplatit_on",
+            help="Modelace pro klienta s dobrým cashflow: v daném roce uměle 'zabijeme' celý zbytek "
+                 "hypotéky z portfolia (nejdřív FKI, pak PUBLIC) — i dřív, než by došel PUBLIC fond. "
+                 "Od té chvíle není splátka a majetek roste bez dluhu."
+        )
+        # Rok doplacení nesmí přesáhnout dobu splácení → ořízneme dřív, než vykreslíme posuvník
+        max_rok_dopl = max(1, int(doba))
+        if st.session_state.get("pl_doplatit_rok", 1) > max_rok_dopl:
+            st.session_state["pl_doplatit_rok"] = max_rok_dopl
+        doplatit_rok = st.slider(
+            "📅 V kterém roce doplatit úvěr", 1, max_rok_dopl, step=1,
+            key="pl_doplatit_rok", disabled=not doplatit_on
+        )
+
         # --- FÁZE 2: RENTA Z MAJETKU (MRKVIČKA) ---
         renta_on = st.checkbox(
             "🥕 Po splacení hypotéky čerpat rentu z vybudovaného majetku", key="pl_renta_on"
@@ -564,7 +696,8 @@ def render(tab):
         df_rok, df_mesic, S = _simulace(
             hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
             spoluucast, inflace, po_vycerpani,
-            renta_on, renta_roky, renta_vynos, renta_castka
+            renta_on, renta_roky, renta_vynos, renta_castka,
+            vek=int(vek), doplatit_on=doplatit_on, doplatit_rok=doplatit_rok
         )
 
         # Splátka se "rozsvítí"
@@ -594,31 +727,58 @@ def render(tab):
         # Svislé čáry událostí. Pozor: při "Jednorázově doplatit z FKI" padne vyčerpání PUBLIC
         # a doplacení úvěru do stejného měsíce → sloučíme do jedné čáry, popisky dáme na opačné
         # strany, ať se text nepřekrývá.
+        def _vek_popis(rok):
+            return f" • {int(vek) + int(round(rok))} let"
+
+        plan = S["doplatek_plan_mesic"]
         dop = S["jednorazovy_doplatek_mesic"]
         vyc = S["public_vycerpan_mesic"]
-        if dop:
-            fig.add_vline(x=dop / 12, line_width=2, line_dash="dot", line_color="#f1c40f",
-                          annotation_text="💸 Úvěr doplacen z FKI", annotation_position="top left",
-                          annotation_font_color="#f1c40f")
+        if plan:
+            r = plan / 12
+            fig.add_vline(x=r, line_width=2, line_dash="dot", line_color="#9b59b6",
+                          annotation_text=f"🔪 Plánované doplacení{_vek_popis(r)}",
+                          annotation_position="top left", annotation_font_color="#9b59b6")
+        elif dop:
+            r = dop / 12
+            fig.add_vline(x=r, line_width=2, line_dash="dot", line_color="#f1c40f",
+                          annotation_text=f"💸 Úvěr doplacen z FKI{_vek_popis(r)}",
+                          annotation_position="top left", annotation_font_color="#f1c40f")
         elif vyc:
-            fig.add_vline(x=vyc / 12, line_width=2, line_dash="dash", line_color="#e74c3c",
-                          annotation_text="PUBLIC vyčerpán", annotation_position="top left",
-                          annotation_font_color="#e74c3c")
+            r = vyc / 12
+            fig.add_vline(x=r, line_width=2, line_dash="dash", line_color="#e74c3c",
+                          annotation_text=f"PUBLIC vyčerpán{_vek_popis(r)}",
+                          annotation_position="top left", annotation_font_color="#e74c3c")
         if renta_on:
-            fig.add_vline(x=S["mesice_p1"] / 12, line_width=2, line_dash="dash", line_color="#1abc9c",
-                          annotation_text="🥕 Start renty", annotation_position="top right",
-                          annotation_font_color="#1abc9c")
+            r = S["mesice_p1"] / 12
+            fig.add_vline(x=r, line_width=2, line_dash="dash", line_color="#1abc9c",
+                          annotation_text=f"🥕 Start renty{_vek_popis(r)}",
+                          annotation_position="top right", annotation_font_color="#1abc9c")
 
+        # Osa X ukazuje rok i věk klienta (dvouřádkové popisky)
+        celkem_let = int(round(S["mesice_celkem"] / 12))
+        krok = 5 if celkem_let > 12 else 2
+        tickvals = list(range(0, celkem_let + 1, krok))
+        ticktext = [f"{rr}<br>{int(vek) + rr} let" for rr in tickvals]
         fig.update_layout(
             template="plotly_dark", title="Analýza finanční páky a rentability",
-            xaxis_title="Rok", yaxis_title="Hodnota (Kč)", hovermode="x unified",
+            yaxis_title="Hodnota (Kč)", hovermode="x unified",
+            xaxis=dict(title="Rok / věk klienta", tickmode="array",
+                       tickvals=tickvals, ticktext=ticktext),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
         )
         st.plotly_chart(fig, use_container_width=True)
 
         # --- VERDIKT FÁZE 1 ---
         vyc_m = S["public_vycerpan_mesic"]
-        if S["jednorazovy_doplatek_mesic"]:
+        if S["doplatek_plan_mesic"]:
+            rok_p = (S["doplatek_plan_mesic"] + 11) // 12
+            st.markdown(
+                f'<div class="big-verdict verdict-yes">🟢 PLÁNOVANÉ DOPLACENÍ — v {rok_p}. roce '
+                f'(ve věku {int(vek) + rok_p} let) jsi jednorázově doplatil zbytek hypotéky z portfolia. '
+                f'Od té chvíle nemáš splátku a roste ti čistý majetek bez dluhu.</div>',
+                unsafe_allow_html=True
+            )
+        elif S["jednorazovy_doplatek_mesic"]:
             rok_dop = (S["jednorazovy_doplatek_mesic"] + 11) // 12
             st.markdown(
                 f'<div class="big-verdict verdict-yes">🟢 PÁKA VYŠLA — v {rok_dop}. roce už byl majetek '
@@ -657,8 +817,8 @@ def render(tab):
         # --- VERDIKT FÁZE 2: RENTA (MRKVIČKA) ---
         if renta_on and S["pool_start_faze2"]:
             st.markdown(
-                f"#### 🥕 A teď ta odměna: po {int(doba)} letech máš vybudováno "
-                f"**{_kc(S['pool_start_faze2'])}** a začínáš čerpat rentu."
+                f"#### 🥕 A teď ta odměna: po {int(doba)} letech (ve věku {int(vek) + int(doba)} let) "
+                f"máš vybudováno **{_kc(S['pool_start_faze2'])}** a začínáš čerpat rentu."
             )
             if S["renta_udrzitelna"]:
                 st.markdown(
@@ -685,6 +845,7 @@ def render(tab):
         roky_k_zobrazeni = sorted(set([0] + list(range(5, total_years + 1, 5)) + [int(doba), total_years]))
         df_tab = df_rok[df_rok["Rok"].isin(roky_k_zobrazeni)].copy()
         df_fmt = df_tab.copy()
+        df_fmt["Věk"] = df_fmt["Věk"].astype(int)
         for sl in ["Zůstatek hypotéky", "PUBLIC složka", "FKI složka", "Majetek celkem", "Majetek reálně"]:
             df_fmt[sl] = df_fmt[sl].apply(_kc)
         st.dataframe(df_fmt, use_container_width=True, hide_index=True)
@@ -695,7 +856,9 @@ def render(tab):
         f1.metric("🏆 Vybudovaný majetek (konec splácení)", _kc(S["majetek_konec_p1"]))
         f2.metric("📈 Čistý zisk z arbitráže", _kc(S["arbitraz"]),
                   help="Vybudovaný majetek minus vše vložené z vlastní kapsy (půjčená jistina se splatí).")
-        if S["jednorazovy_doplatek_mesic"]:
+        if S["doplatek_plan_mesic"]:
+            f3.metric("🔵 Status hypotéky", f"Plánovaně doplacena v {(S['doplatek_plan_mesic'] + 11) // 12}. roce")
+        elif S["jednorazovy_doplatek_mesic"]:
             f3.metric("🔵 Status PUBLIC fondu", f"Úvěr doplacen z FKI v {(S['jednorazovy_doplatek_mesic'] + 11) // 12}. roce")
         elif vyc_m is None:
             f3.metric("🔵 Status PUBLIC fondu", "Nevyčerpán")
@@ -714,6 +877,7 @@ def render(tab):
 
         with st.expander("📊 Detailní tabulka po letech & Export"):
             df_rok_fmt = df_rok.copy()
+            df_rok_fmt["Věk"] = df_rok_fmt["Věk"].astype(int)
             for sl in ["Zůstatek hypotéky", "PUBLIC složka", "FKI složka", "Majetek celkem", "Majetek reálně"]:
                 df_rok_fmt[sl] = df_rok_fmt[sl].apply(_kc)
             st.dataframe(df_rok_fmt, use_container_width=True, hide_index=True)
@@ -729,25 +893,27 @@ def render(tab):
                 st.warning("Generování PDF zatím není dostupné (instaluje se balíček fpdf2). "
                            "Zkus to prosím za chvíli po nasazení.")
             else:
-                st.caption("Vygeneruje čistou jednostránkovou nabídku s aktuálními hodnotami "
-                           "(zadání, klíčová čísla, graf a vyhodnocení). PDF odráží hodnoty "
-                           "v okamžiku vygenerování — po změně posuvníků vygeneruj znovu.")
-                pc1, pc2 = st.columns(2)
-                klient = pc1.text_input("Jméno klienta (volitelné)", key="pl_klient")
-                poradce = pc2.text_input("Zpracoval (poradce)", value="Jiří Vrána", key="pl_poradce")
+                st.caption("Vygeneruje klientskou nabídku s aktuálními hodnotami (zadání, klíčová "
+                           "čísla, graf s věkovou osou, vyhodnocení a disclaimer). Jméno a věk se "
+                           "berou z horní části. PDF odráží hodnoty v okamžiku vygenerování — "
+                           "po změně posuvníků vygeneruj znovu.")
+                poradce = st.text_input("Zpracoval (poradce)", value="Jiří Vrána", key="pl_poradce")
+                if klient_cele:
+                    st.caption(f"📋 Nabídka pro: **{klient_cele}**, {int(vek)} let")
                 if st.button("🖨️ Vygenerovat nabídku (PDF)", key="btn_paka_pdf_gen"):
                     with st.spinner("Generuji PDF…"):
                         try:
                             st.session_state["pl_pdf_bytes"] = _vytvor_pdf(
-                                klient, poradce, hypo, sazba, doba, public0, fki0,
+                                klient_cele, poradce, hypo, sazba, doba, public0, fki0,
                                 vyn_public, vyn_fki, spoluucast, inflace, po_vycerpani,
-                                renta_on, renta_castka, renta_vynos, renta_roky, df_mesic, S
+                                renta_on, renta_castka, renta_vynos, renta_roky, df_mesic, S,
+                                vek=int(vek), doplatit_on=doplatit_on, doplatit_rok=doplatit_rok
                             )
                         except Exception as e:
                             st.session_state.pop("pl_pdf_bytes", None)
                             st.error(f"Nepodařilo se vygenerovat PDF: {e}")
                 if st.session_state.get("pl_pdf_bytes"):
-                    bezpecne_jmeno = re.sub(r"[^\w\-]+", "_", (klient or "klient").strip()) or "klient"
+                    bezpecne_jmeno = re.sub(r"[^\w\-]+", "_", (klient_cele or "klient").strip()) or "klient"
                     st.download_button(
                         "📥 Stáhnout nabídku (PDF)",
                         st.session_state["pl_pdf_bytes"],
