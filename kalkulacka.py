@@ -90,7 +90,11 @@ with st.sidebar:
             "pl_renta_vynos": st.session_state.get("pl_renta_vynos", 8.0),
             "pl_renta_castka": st.session_state.get("pl_renta_castka", 50000.0),
             "pl_pozn_uvod": st.session_state.get("pl_pozn_uvod", ""),
-            "pl_pozn_zaver": st.session_state.get("pl_pozn_zaver", "")
+            "pl_pozn_zaver": st.session_state.get("pl_pozn_zaver", ""),
+            "pl_start_mesic": st.session_state.get("pl_start_mesic", 1),
+            "pl_start_rok": st.session_state.get("pl_start_rok", 2026),
+            "pl_useky": st.session_state.get("pl_useky", []),
+            "pl_usek_id": st.session_state.get("pl_usek_id", 0)
         }
         return json.dumps(data)
 
@@ -107,6 +111,9 @@ with st.sidebar:
     if nahrat_soubor is not None:
         if st.button("Načíst data a přepsat kalkulačku"):
             nactena_data = json.load(nahrat_soubor)
+            # Widgety úseků (Modul 7) mají vlastní klíče — smažeme je, ať převezmou načtené hodnoty
+            for klic in [x for x in st.session_state if str(x).startswith("plu_")]:
+                del st.session_state[klic]
             for klic, hodnota in nactena_data.items():
                 st.session_state[klic] = hodnota
             st.success("✅ Scénář nahrán! Data jsou aktualizována.")

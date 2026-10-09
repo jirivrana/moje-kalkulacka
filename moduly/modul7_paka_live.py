@@ -69,6 +69,11 @@ VYCHOZI_PAKA = {
     # Volné poznámky poradce do PDF nabídky (úvodní oslovení + závěrečné sdělení)
     "pl_pozn_uvod": "",
     "pl_pozn_zaver": "",
+    # Kalendář: začátek splácení + úseky s jiným výběrem z portfolia (např. mateřská)
+    "pl_start_mesic": date.today().month,
+    "pl_start_rok": date.today().year,
+    "pl_useky": [],
+    "pl_usek_id": 0,
 }
 
 PO_VYCERPANI_OPTIONS = [
@@ -81,7 +86,7 @@ PO_VYCERPANI_OPTIONS = [
 def _init_state():
     for k, v in VYCHOZI_PAKA.items():
         if k not in st.session_state:
-            st.session_state[k] = v
+            st.session_state[k] = list(v) if isinstance(v, list) else v
     # Ošetření zastaralé hodnoty z dřívějších verzí (jinak by selectbox spadl)
     if st.session_state.get("pl_po_vycerpani") not in PO_VYCERPANI_OPTIONS:
         st.session_state["pl_po_vycerpani"] = PO_VYCERPANI_OPTIONS[0]
@@ -91,14 +96,37 @@ def _kc(x):
     return f"{x:,.0f} Kč".replace(",", " ")
 
 
+def _mesic_idx(mesic, rok, start_mesic, start_rok):
+    """Pořadové číslo měsíce simulace (1 = první splátka) pro kalendářní měsíc/rok."""
+    return (int(rok) - int(start_rok)) * 12 + (int(mesic) - int(start_mesic)) + 1
+
+
+def _datum_txt(m, start_mesic, start_rok):
+    """Kalendářní měsíc/rok (MM/RRRR) pro m-tý měsíc simulace."""
+    k = int(start_mesic) - 1 + (int(m) - 1)
+    return f"{k % 12 + 1:02d}/{int(start_rok) + k // 12}"
+
+
+def _usek_castka(useky, m):
+    """Vrátí měsíční výběr z portfolia, pokud m-tý měsíc spadá do některého úseku (jinak None)."""
+    for od, do, castka in useky:
+        if od <= m <= do:
+            return castka
+    return None
+
+
 def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
               spoluucast, inflace, po_vycerpani,
               renta_on, renta_roky, renta_vynos, renta_castka,
-              vek=40, doplatit_on=False, doplatit_rok=0):
+              vek=40, doplatit_on=False, doplatit_rok=0,
+              useky=None, start_mesic=1, start_rok=2026):
     """Dvoufázová simulace páky.
     Fáze 1: splácení hypotéky, sanace z PUBLIC + kapsy, FKI roste.
     Fáze 2 (volitelně): čerpání renty z vybudovaného majetku.
-    Volitelně lze hypotéku plánovaně jednorázově doplatit z portfolia (what-if)."""
+    Volitelně lze hypotéku plánovaně jednorázově doplatit z portfolia (what-if).
+    useky = seznam (od_mesic, do_mesic, castka): v těchto měsících fáze 1 dává portfolio pevnou
+    částku — zbytek splátky jde z kapsy, přebytek nad splátku se vyplácí klientovi."""
+    useky = useky or []
     mesice_p1 = int(doba * 12)
     mesice_p2 = int(renta_roky * 12) if renta_on else 0
     mesice_celkem = mesice_p1 + mesice_p2
@@ -116,6 +144,7 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
     celkem_z_fki = 0.0
     celkem_uroky = 0.0
     odkup_kum = 0.0  # kumulativní odkupy z portfolia na sanaci splátky (fáze 1)
+    navic_kum = 0.0  # kumulativně vyplaceno klientovi nad rámec splátky (úseky)
 
     renta_vyplaceno = 0.0
     renta_dosla_mesic = None
@@ -125,11 +154,13 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
     majetek_real_konec_p1 = public0 + fki0
 
     xs, h, pub, f, maj, maj_real, zust_real, odk, rnt = [], [], [], [], [], [], [], [], []
+    kap_m, port_m, nav = [], [], []
     rok_rows = [{
-        "Rok": 0, "Věk": float(vek), "Zůstatek hypotéky": zust, "PUBLIC složka": public,
+        "Rok": 0, "Datum": "start", "Věk": float(vek), "Zůstatek hypotéky": zust, "PUBLIC složka": public,
         "FKI složka": fki, "Majetek celkem": public + fki,
         "Majetek reálně": public + fki,
-        "Odkupy na sanaci (kumul.)": 0.0, "Vyplacená renta (kumul.)": 0.0
+        "Odkupy na sanaci (kumul.)": 0.0, "Vyplacená renta (kumul.)": 0.0,
+        "Z kapsy / měs": 0.0, "Z portfolia / měs": 0.0, "Výběr nad splátku (kumul.)": 0.0
     }]
 
     for m in range(1, mesice_celkem + 1):
@@ -168,14 +199,22 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
                 zust = 0.0
                 platba = 0.0
 
+            # Úsek s jiným výběrem z portfolia (např. mateřská): portfolio dává pevnou částku,
+            # zbytek splátky jde z kapsy; co je nad splátku, vyplácí se klientovi navíc.
+            usek_vyber = _usek_castka(useky, m)
+            spol_m = spoluucast if usek_vyber is None else max(0.0, platba - usek_vyber)
+            z_kapsy = 0.0
+            z_portfolia = 0.0
+
             if platba > 0:
                 potreba = platba
-                z_kapsy = min(spoluucast, potreba)
+                z_kapsy = min(spol_m, potreba)
                 potreba -= z_kapsy
                 z_public = min(public, potreba)
                 public -= z_public
                 potreba -= z_public
                 odkup_kum += z_public  # odkup z PUBLIC fondu na sanaci splátky
+                z_portfolia += z_public
 
                 if potreba > 0:
                     if public_vycerpan_mesic is None and public <= 0.01:
@@ -188,18 +227,31 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
                         jednorazovy_doplatek_mesic = m
                         zust = 0.0
                         potreba = 0.0
-                    elif po_vycerpani == "Doplácet z FKI fondu":
+                    elif po_vycerpani == "Doplácet z FKI fondu" or usek_vyber is not None:
+                        # V úseku je výběr z portfolia zadaný výslovně → po vyčerpání PUBLIC
+                        # se bere z FKI bez ohledu na obecné pravidlo.
                         z_fki = min(fki, potreba)
                         fki -= z_fki
                         potreba -= z_fki
                         celkem_z_fki += z_fki
                         odkup_kum += z_fki  # odkup z FKI na sanaci splátky
+                        z_portfolia += z_fki
                         z_kapsy += potreba
                         potreba = 0.0
                     else:
                         z_kapsy += potreba
                         potreba = 0.0
                 celkem_z_kapsy += z_kapsy
+
+            # Výběr nad rámec splátky (jen v úseku): nejdřív z PUBLIC, pak z FKI
+            if usek_vyber is not None and usek_vyber > platba + 0.005:
+                navic = usek_vyber - platba
+                n_pub = min(public, navic)
+                public -= n_pub
+                n_fki = min(fki, navic - n_pub)
+                fki -= n_fki
+                navic_kum += n_pub + n_fki
+                z_portfolia += n_pub + n_fki
 
             majetek = public + fki
             if m == mesice_p1:
@@ -220,6 +272,8 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
             fki = faze2_pool
             zust = 0.0
             majetek = faze2_pool
+            z_kapsy = 0.0
+            z_portfolia = vyber
 
         xs.append(m / 12)
         h.append(max(0.0, zust))
@@ -230,14 +284,20 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
         zust_real.append(max(0.0, zust) / coef)
         odk.append(odkup_kum)
         rnt.append(renta_vyplaceno)
+        kap_m.append(z_kapsy)
+        port_m.append(z_portfolia)
+        nav.append(navic_kum)
 
         if m % 12 == 0:
             rok_rows.append({
-                "Rok": m // 12, "Věk": float(vek + m // 12), "Zůstatek hypotéky": max(0.0, zust),
+                "Rok": m // 12, "Datum": _datum_txt(m, start_mesic, start_rok),
+                "Věk": float(vek + m // 12), "Zůstatek hypotéky": max(0.0, zust),
                 "PUBLIC složka": public, "FKI složka": fki,
                 "Majetek celkem": majetek, "Majetek reálně": majetek / coef,
                 "Odkupy na sanaci (kumul.)": odkup_kum,
-                "Vyplacená renta (kumul.)": renta_vyplaceno
+                "Vyplacená renta (kumul.)": renta_vyplaceno,
+                "Z kapsy / měs": z_kapsy, "Z portfolia / měs": z_portfolia,
+                "Výběr nad splátku (kumul.)": navic_kum
             })
 
     df_rok = pd.DataFrame(rok_rows)
@@ -245,7 +305,9 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
         "Rok": xs, "Věk": [vek + x for x in xs],
         "Zůstatek hypotéky": h, "PUBLIC složka": pub, "FKI složka": f,
         "Majetek celkem": maj, "Majetek reálně": maj_real, "Dluh reálně": zust_real,
-        "Odkupy na sanaci (kumul.)": odk, "Vyplacená renta (kumul.)": rnt
+        "Odkupy na sanaci (kumul.)": odk, "Vyplacená renta (kumul.)": rnt,
+        "Z kapsy / měs": kap_m, "Z portfolia / měs": port_m,
+        "Výběr nad splátku (kumul.)": nav
     })
 
     # Udržitelnost renty (fáze 2)
@@ -260,7 +322,11 @@ def _simulace(hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
         "majetek_konec": maj[-1] if maj else (public0 + fki0),
         "majetek_konec_p1": majetek_konec_p1,
         "majetek_real_konec_p1": majetek_real_konec_p1,
-        "arbitraz": majetek_konec_p1 - celkem_z_kapsy,
+        "arbitraz": majetek_konec_p1 - celkem_z_kapsy + navic_kum,
+        "navic_celkem": navic_kum,
+        "useky": list(useky),
+        "start_mesic": int(start_mesic),
+        "start_rok": int(start_rok),
         "celkem_z_kapsy": celkem_z_kapsy,
         "celkem_z_fki": celkem_z_fki,
         "celkem_uroky": celkem_uroky,
@@ -319,6 +385,9 @@ def _graf_pro_pdf(df_mesic, S, renta_on):
         if renta_on:
             ax.plot(x, df_mesic["Vyplacená renta (kumul.)"], color="#16a085", lw=2.0,
                     label="Vyplacená renta (kumul.)")
+        if S.get("navic_celkem", 0) > 0:
+            ax.plot(x, df_mesic["Výběr nad splátku (kumul.)"], color="#f39c12", lw=1.4, ls=":",
+                    label="Vyplaceno nad splátku (kumul.)")
         ax.set_xlabel("Rok")
         ax.set_ylabel("Kč")
         ax.margins(x=0.01)
@@ -343,6 +412,8 @@ def _graf_pro_pdf(df_mesic, S, renta_on):
             _udalost(vyc / 12, "#e74c3c", "PUBLIC vyčerpán")
         if renta_on:
             _udalost(S["mesice_p1"] / 12, "#16a085", "Start renty")
+        for u_od, u_do, _u_c in S.get("useky", []):
+            ax.axvspan((u_od - 1) / 12, u_do / 12, color="#f39c12", alpha=0.12, lw=0)
 
         # Sekundární osa nahoře = věk klienta
         if vek is not None:
@@ -506,6 +577,7 @@ def _vytvor_pdf(klient, poradce, hypo, sazba, doba, public0, fki0,
         ("Spoluúčast z kapsy", f"{_kc(spoluucast)} / měs"),
         ("Inflace", f"{inflace:.1f} % p.a."),
         ("Po vyčerpání PUBLIC", po_vycerpani),
+        ("Začátek splácení", _datum_txt(1, S["start_mesic"], S["start_rok"])),
     ]
     if doplatit_on:
         params.append(("Plánované doplacení úvěru", f"v {int(doplatit_rok)}. roce"))
@@ -526,6 +598,24 @@ def _vytvor_pdf(klient, poradce, hypo, sazba, doba, public0, fki0,
             pdf.cell(52, 6, params[i + 1][1])
             pdf.set_font("DejaVu", "", 9.5)
         pdf.set_xy(15, y0 + 7)
+
+    # Kalendářní úseky s jiným výběrem z portfolia
+    if S["useky"]:
+        pdf.set_font("DejaVu", "B", 9.5)
+        pdf.set_text_color(20, 20, 20)
+        pdf.cell(0, 6, "Úseky s jiným výběrem z portfolia (oranžově v grafu):",
+                 new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("DejaVu", "", 9.5)
+        for u_od, u_do, u_castka in S["useky"]:
+            if u_castka > S["splatka"]:
+                efekt = f"z toho {_kc(u_castka - S['splatka'])}/měs vyplaceno klientovi nad splátku"
+            else:
+                efekt = f"z kapsy {_kc(S['splatka'] - u_castka)}/měs"
+            pdf.cell(0, 5.5, f"  •  {_datum_txt(u_od, S['start_mesic'], S['start_rok'])} – "
+                             f"{_datum_txt(u_do, S['start_mesic'], S['start_rok'])}: "
+                             f"z portfolia {_kc(u_castka)}/měs ({efekt})",
+                     new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(1)
 
     # ---- SEKCE: KLÍČOVÉ VÝSLEDKY ----
     _pdf_nadpis(pdf, "Klíčové výsledky")
@@ -550,6 +640,9 @@ def _vytvor_pdf(klient, poradce, hypo, sazba, doba, public0, fki0,
     pdf.set_text_color(110, 110, 110)
     pdf.cell(0, 5, f"Z toho úroky zaplacené bance: {_kc(S['celkem_uroky'])}",
              new_x="LMARGIN", new_y="NEXT")
+    if S["navic_celkem"] > 0:
+        pdf.cell(0, 5, f"Vyplaceno z portfolia nad rámec splátky (úseky): {_kc(S['navic_celkem'])}",
+                 new_x="LMARGIN", new_y="NEXT")
     if renta_on and S["pool_start_faze2"]:
         pdf.cell(0, 5, f"Celkem vyčerpáno na rentě: {_kc(S['renta_vyplaceno'])}",
                  new_x="LMARGIN", new_y="NEXT")
@@ -701,6 +794,80 @@ def render(tab):
             help="Inflace rozpouští reálnou hodnotu dluhu (dobré pro dlužníka), ale i reálnou hodnotu majetku."
         )
 
+        # --- KALENDÁŘ: ÚSEKY S JINÝM VÝBĚREM Z PORTFOLIA ---
+        st.markdown("#### 📆 Kalendář: úseky s jiným výběrem z portfolia")
+        st.caption(
+            "Typicky mateřská: po určité období bere klient z portfolia víc (nebo míň) než běžně. "
+            "V úseku nastavíš, kolik má portfolio měsíčně dávat — zbytek splátky jde z kapsy; "
+            "když je částka vyšší než splátka, rozdíl se vyplácí klientovi navíc. "
+            "Mimo úseky platí jezdec spoluúčasti výše."
+        )
+        d1, d2, _d3 = st.columns([1, 1, 3])
+        start_mesic = d1.selectbox("Začátek splácení – měsíc", list(range(1, 13)),
+                                   key="pl_start_mesic", format_func=lambda x: f"{x:02d}")
+        start_rok = int(d2.number_input("Začátek splácení – rok", min_value=2000, max_value=2100,
+                                        step=1, key="pl_start_rok"))
+
+        useky_sim = []
+        ke_smazani = None
+        for u in st.session_state["pl_useky"]:
+            uid = u["id"]
+            ua, ub, uc, ud, ue, ug = st.columns([1, 1.2, 1, 1.2, 2, 0.6])
+            u["od_m"] = ua.selectbox("Od – měsíc", list(range(1, 13)), index=int(u["od_m"]) - 1,
+                                     key=f"plu_{uid}_od_m", format_func=lambda x: f"{x:02d}")
+            u["od_r"] = int(ub.number_input("Od – rok", min_value=2000, max_value=2100,
+                                            value=int(u["od_r"]), step=1, key=f"plu_{uid}_od_r"))
+            u["do_m"] = uc.selectbox("Do – měsíc (včetně)", list(range(1, 13)), index=int(u["do_m"]) - 1,
+                                     key=f"plu_{uid}_do_m", format_func=lambda x: f"{x:02d}")
+            u["do_r"] = int(ud.number_input("Do – rok", min_value=2000, max_value=2100,
+                                            value=int(u["do_r"]), step=1, key=f"plu_{uid}_do_r"))
+            u["castka"] = float(ue.number_input("Výběr z portfolia (Kč/měs)", min_value=0.0,
+                                                value=float(u["castka"]), step=1000.0,
+                                                key=f"plu_{uid}_castka"))
+            ug.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            if ug.button("🗑️", key=f"plu_{uid}_del", help="Smazat úsek"):
+                ke_smazani = uid
+
+            od_idx = _mesic_idx(u["od_m"], u["od_r"], start_mesic, start_rok)
+            do_idx = _mesic_idx(u["do_m"], u["do_r"], start_mesic, start_rok)
+            if do_idx < od_idx:
+                st.warning("Konec úseku je dřív než jeho začátek — úsek se nepočítá.")
+            elif do_idx < 1 or od_idx > mesice_p1:
+                st.warning(f"Úsek leží mimo dobu splácení ({_datum_txt(1, start_mesic, start_rok)} – "
+                           f"{_datum_txt(mesice_p1, start_mesic, start_rok)}) — nepočítá se.")
+            else:
+                od_idx, do_idx = max(1, od_idx), min(mesice_p1, do_idx)
+                if any(od_idx <= b and a <= do_idx for a, b, _c in useky_sim):
+                    st.warning("Úsek se překrývá s jiným — v překryvu platí ten dřív uvedený.")
+                useky_sim.append((od_idx, do_idx, u["castka"]))
+                if u["castka"] > splatka:
+                    efekt = (f"portfolio zaplatí celou splátku a klientovi navíc vyplatí "
+                             f"**{_kc(u['castka'] - splatka)}/měs**")
+                else:
+                    efekt = f"z kapsy se doplácí **{_kc(splatka - u['castka'])}/měs**"
+                st.caption(f"↳ {do_idx - od_idx + 1} měsíců: {efekt}.")
+
+        if ke_smazani is not None:
+            st.session_state["pl_useky"] = [x for x in st.session_state["pl_useky"] if x["id"] != ke_smazani]
+            st.rerun()
+        if st.button("➕ Přidat úsek", key="btn_paka_usek_add"):
+            # Nový úsek navazuje na konec posledního (nebo začíná se splácením) a trvá 3 roky
+            posledni = st.session_state["pl_useky"][-1] if st.session_state["pl_useky"] else None
+            if posledni:
+                od_i = _mesic_idx(posledni["do_m"], posledni["do_r"], start_mesic, start_rok) + 1
+            else:
+                od_i = 1
+            od_txt = _datum_txt(od_i, start_mesic, start_rok)
+            do_txt = _datum_txt(od_i + 35, start_mesic, start_rok)
+            st.session_state["pl_usek_id"] += 1
+            st.session_state["pl_useky"].append({
+                "id": st.session_state["pl_usek_id"],
+                "od_m": int(od_txt[:2]), "od_r": int(od_txt[3:]),
+                "do_m": int(do_txt[:2]), "do_r": int(do_txt[3:]),
+                "castka": float(round(splatka, -2)),
+            })
+            st.rerun()
+
         # --- WHAT-IF: PLÁNOVANÉ DOPLACENÍ HYPOTÉKY Z PORTFOLIA ---
         doplatit_on = st.checkbox(
             "🔪 Co kdybych hypotéku v určitém roce jednorázově doplatil z portfolia?",
@@ -738,15 +905,18 @@ def render(tab):
             hypo, sazba, doba, public0, fki0, vyn_public, vyn_fki,
             spoluucast, inflace, po_vycerpani,
             renta_on, renta_roky, renta_vynos, renta_castka,
-            vek=int(vek), doplatit_on=doplatit_on, doplatit_rok=doplatit_rok
+            vek=int(vek), doplatit_on=doplatit_on, doplatit_rok=doplatit_rok,
+            useky=useky_sim, start_mesic=start_mesic, start_rok=start_rok
         )
 
         # Splátka se "rozsvítí"
         st.markdown("---")
         m1, m2, m3 = st.columns(3)
         m1.metric("📌 Měsíční splátka hypotéky", _kc(S["splatka"]))
-        m2.metric("Z toho z kapsy", _kc(min(spoluucast, S["splatka"])))
-        m3.metric("Z toho z PUBLIC (zpočátku)", _kc(max(0.0, S["splatka"] - spoluucast)))
+        m2.metric("Z toho z kapsy (1. měsíc)", _kc(df_mesic["Z kapsy / měs"].iloc[0]))
+        m3.metric("Z portfolia (1. měsíc)", _kc(df_mesic["Z portfolia / měs"].iloc[0]),
+                  help="Výběr z portfolia v prvním měsíci. V úseku s vyšším výběrem zahrnuje i částku "
+                       "vyplacenou klientovi nad rámec splátky.")
 
         # --- GRAF ---
         fig = go.Figure()
@@ -768,7 +938,20 @@ def render(tab):
         fig.add_trace(go.Scatter(x=df_mesic["Rok"], y=df_mesic["Odkupy na sanaci (kumul.)"],
                                  name="Odkupy na sanaci (kumul.)",
                                  line=dict(color="#e67e22", width=2, dash="dashdot"),
-                                 hovertemplate="Odkupy na sanaci: %{y:,.0f} Kč<extra></extra>"))
+                                 customdata=df_mesic[["Z portfolia / měs", "Z kapsy / měs"]],
+                                 hovertemplate="Odkupy na sanaci: %{y:,.0f} Kč"
+                                               "<br>teď z portfolia %{customdata[0]:,.0f} Kč/měs"
+                                               " • z kapsy %{customdata[1]:,.0f} Kč/měs<extra></extra>"))
+        if S["navic_celkem"] > 0:
+            fig.add_trace(go.Scatter(x=df_mesic["Rok"], y=df_mesic["Výběr nad splátku (kumul.)"],
+                                     name="Vyplaceno nad splátku (kumul.)",
+                                     line=dict(color="#f39c12", width=2, dash="dot"),
+                                     hovertemplate="Vyplaceno nad splátku: %{y:,.0f} Kč<extra></extra>"))
+        for u_od, u_do, u_castka in S["useky"]:
+            fig.add_vrect(x0=(u_od - 1) / 12, x1=u_do / 12, fillcolor="#f39c12", opacity=0.10,
+                          line_width=0, annotation_text=f"z portfolia {_kc(u_castka)}/měs",
+                          annotation_position="bottom left", annotation_font_size=10,
+                          annotation_font_color="#f39c12")
         # Kumulativní vyplacená renta (fáze 2) — roste od startu čerpání
         if renta_on:
             fig.add_trace(go.Scatter(x=df_mesic["Rok"], y=df_mesic["Vyplacená renta (kumul.)"],
@@ -810,11 +993,12 @@ def render(tab):
         celkem_let = int(round(S["mesice_celkem"] / 12))
         krok = 5 if celkem_let > 12 else 2
         tickvals = list(range(0, celkem_let + 1, krok))
-        ticktext = [f"{rr}<br>{int(vek) + rr} let" for rr in tickvals]
+        ticktext = [f"{rr}<br>{int(start_mesic):02d}/{start_rok + rr}<br>{int(vek) + rr} let"
+                    for rr in tickvals]
         fig.update_layout(
             template="plotly_dark", title="Analýza finanční páky a rentability",
             yaxis_title="Hodnota (Kč)", hovermode="x unified",
-            xaxis=dict(title="Rok / věk klienta", tickmode="array",
+            xaxis=dict(title="Rok / kalendář / věk klienta", tickmode="array",
                        tickvals=tickvals, ticktext=ticktext),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0)
         )
@@ -897,9 +1081,11 @@ def render(tab):
         roky_k_zobrazeni = sorted(set([0] + list(range(5, total_years + 1, 5)) + [int(doba), total_years]))
         df_tab = df_rok[df_rok["Rok"].isin(roky_k_zobrazeni)].copy()
         # Souhrnnou tabulku držíme přehlednou — kumulativní odkupy/rentu necháme do detailu níž
-        df_fmt = df_tab.drop(columns=["Odkupy na sanaci (kumul.)", "Vyplacená renta (kumul.)"]).copy()
+        df_fmt = df_tab.drop(columns=["Odkupy na sanaci (kumul.)", "Vyplacená renta (kumul.)",
+                                      "Výběr nad splátku (kumul.)"]).copy()
         df_fmt["Věk"] = df_fmt["Věk"].astype(int)
-        for sl in ["Zůstatek hypotéky", "PUBLIC složka", "FKI složka", "Majetek celkem", "Majetek reálně"]:
+        for sl in ["Zůstatek hypotéky", "PUBLIC složka", "FKI složka", "Majetek celkem", "Majetek reálně",
+                   "Z kapsy / měs", "Z portfolia / měs"]:
             df_fmt[sl] = df_fmt[sl].apply(_kc)
         st.dataframe(df_fmt, use_container_width=True, hide_index=True)
 
@@ -908,7 +1094,8 @@ def render(tab):
         f1, f2, f3 = st.columns(3)
         f1.metric("🏆 Vybudovaný majetek (konec splácení)", _kc(S["majetek_konec_p1"]))
         f2.metric("📈 Čistý zisk z arbitráže", _kc(S["arbitraz"]),
-                  help="Vybudovaný majetek minus vše vložené z vlastní kapsy (půjčená jistina se splatí).")
+                  help="Vybudovaný majetek minus vše vložené z vlastní kapsy (půjčená jistina se splatí). "
+                       "Připočítává se i to, co si klient z portfolia vybral nad rámec splátky.")
         if S["doplatek_plan_mesic"]:
             f3.metric("🔵 Status hypotéky", f"Plánovaně doplacena v {(S['doplatek_plan_mesic'] + 11) // 12}. roce")
         elif S["jednorazovy_doplatek_mesic"]:
@@ -925,6 +1112,8 @@ def render(tab):
                   help="Inflace ti dluh v čase 'rozpouští' — toto je jeho reálná tíha na konci.")
         g3.metric("💸 Celkem z kapsy / úroky bance", f"{_kc(S['celkem_z_kapsy'])} / {_kc(S['celkem_uroky'])}")
 
+        if S["navic_celkem"] > 0:
+            st.metric("👶 Vyplaceno z portfolia nad rámec splátky (úseky)", _kc(S["navic_celkem"]))
         if renta_on and S["pool_start_faze2"]:
             st.metric("🥕 Celkem vyčerpáno na rentě", _kc(S["renta_vyplaceno"]))
 
@@ -932,7 +1121,8 @@ def render(tab):
             df_rok_fmt = df_rok.copy()
             df_rok_fmt["Věk"] = df_rok_fmt["Věk"].astype(int)
             for sl in ["Zůstatek hypotéky", "PUBLIC složka", "FKI složka", "Majetek celkem",
-                       "Majetek reálně", "Odkupy na sanaci (kumul.)", "Vyplacená renta (kumul.)"]:
+                       "Majetek reálně", "Odkupy na sanaci (kumul.)", "Vyplacená renta (kumul.)",
+                       "Z kapsy / měs", "Z portfolia / měs", "Výběr nad splátku (kumul.)"]:
                 df_rok_fmt[sl] = df_rok_fmt[sl].apply(_kc)
             st.dataframe(df_rok_fmt, use_container_width=True, hide_index=True)
             st.download_button(
